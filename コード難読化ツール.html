@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>コード難読化ツール</title>
+<style>
+:root{
+  --bg:#f5f6f8; --surface:#ffffff; --text:#1a1d23; --sub:#5b6270;
+  --accent:#4f46e5; --accent-text:#ffffff; --border:#dfe2e8; --mono:#eef0f4;
+  color-scheme: light;
+  box-sizing:border-box;
+  padding-top: env(safe-area-inset-top,0px);
+  padding-bottom: env(safe-area-inset-bottom,0px);
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#15171c; --surface:#1d2026; --text:#e8e9ec; --sub:#9aa0ac;
+    --accent:#818cf8; --accent-text:#15171c; --border:#2c2f37; --mono:#262a32;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#15171c; --surface:#1d2026; --text:#e8e9ec; --sub:#9aa0ac;
+  --accent:#818cf8; --accent-text:#15171c; --border:#2c2f37; --mono:#262a32;
+  color-scheme: dark;
+}
+*{box-sizing:border-box;}
+body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;}
+.wrap{max-width:720px;margin:0 auto;padding:20px 16px 40px;}
+h1{font-size:1.3rem;margin:4px 0 4px;}
+.desc{color:var(--sub);font-size:0.85rem;margin-bottom:16px;line-height:1.5;}
+.tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px;}
+.tab{padding:7px 12px;border-radius:8px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:0.85rem;cursor:pointer;}
+.tab.active{background:var(--accent);color:var(--accent-text);border-color:var(--accent);}
+#opts{display:flex;flex-direction:column;gap:2px;margin-bottom:6px;}
+label.opt{display:flex;align-items:center;gap:6px;font-size:0.83rem;color:var(--sub);margin:4px 0;}
+textarea{width:100%;min-height:150px;background:var(--mono);color:var(--text);border:1px solid var(--border);border-radius:10px;padding:10px;font-family:ui-monospace,Menlo,monospace;font-size:0.8rem;resize:vertical;}
+.btnrow{display:flex;gap:8px;margin:10px 0;}
+button.main{background:var(--accent);color:var(--accent-text);border:none;border-radius:8px;padding:10px 16px;font-size:0.9rem;font-weight:600;cursor:pointer;flex:1;}
+button.ghost{background:transparent;color:var(--text);border:1px solid var(--border);border-radius:8px;padding:10px 14px;font-size:0.85rem;cursor:pointer;}
+.out-label{font-size:0.8rem;color:var(--sub);margin:14px 0 6px;display:flex;justify-content:space-between;align-items:center;}
+.note{font-size:0.75rem;color:var(--sub);margin-top:18px;line-height:1.6;border-top:1px solid var(--border);padding-top:12px;}
+.note b{color:var(--text);}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🔒 コード難読化ツール</h1>
+  <div class="desc">JS / Node.js / HTML / CSS / Python のコードを難読化します。チェックした項目は上から順に適用されます。</div>
+
+  <div class="tabs" id="tabs"></div>
+  <div id="opts"></div>
+
+  <textarea id="input" placeholder="ここにコードを貼り付け"></textarea>
+  <div class="btnrow">
+    <button class="main" id="run">難読化する</button>
+    <button class="ghost" id="clear">クリア</button>
+  </div>
+
+  <div class="out-label"><span>出力結果</span><button class="ghost" id="copy">コピー</button></div>
+  <textarea id="output" readonly placeholder="結果がここに表示されます"></textarea>
+
+  <div class="note">
+    <b>各オプションの注意点</b><br>
+    ・<b>デッドコード挿入 / 制御フロー平坦化</b>：単純な逐次処理コード向けの簡易実装です。関数定義・ループ・クラスをまたぐ複雑な構造では壊れる場合があるため、変換後は必ず動作確認してください。<br>
+    ・<b>文字列配列化</b>：テンプレートリテラル(`` ` ``)の中身は抽出対象外ですが、壊さず安全にスキップします。<br>
+    ・文字列やテンプレートリテラル（HTMLを埋め込んだ場合も含む）の途中ではデッドコード挿入・制御フロー平坦化が発生しないよう、文字列の境界を検出して処理します。<br>
+    ・全体として暗号化ではなく難読化（可読性を下げる処理）です。マルウェアや検出回避目的の利用はできません。
+  </div>
+</div>
+
+<script>
+const LANGS = {
+  js:   {label:"JavaScript", opts:["deadCode","stringArray","cff","minify","oneLine","pack"]},
+  node: {label:"Node.js",    opts:["deadCode","stringArray","cff","minify","oneLine","pack"]},
+  html: {label:"HTML",       opts:["deadCode","stringArray","cff","minify","oneLine","pack"]},
+  css:  {label:"CSS",        opts:["minify"]},
+  py:   {label:"Python",     opts:["deadCode","stringArray","pack"]},
+};
+const OPT_LABEL = {
+  deadCode:"デッドコードを挿入する",
+  stringArray:"文字列リテラルを配列化する",
+  cff:"制御フローをフラット化する",
+  minify:"圧縮・コメント除去する",
+  oneLine:"コードを1行にする",
+  pack:"base64パック (eval/exec方式)",
+};
+let current = "js";
+
+const tabsEl = document.getElementById("tabs");
+const optsEl = document.getElementById("opts");
+Object.keys(LANGS).forEach(key=>{
+  const b = document.createElement("button");
+  b.className = "tab" + (key===current ? " active":"");
+  b.textContent = LANGS[key].label;
+  b.onclick = ()=>{ current = key; render(); };
+  b.dataset.key = key;
+  tabsEl.appendChild(b);
+});
+
+function render(){
+  [...tabsEl.children].forEach(b=>b.classList.toggle("active", b.dataset.key===current));
+  optsEl.innerHTML = "";
+  LANGS[current].opts.forEach(o=>{
+    const id = "opt_"+o;
+    const label = document.createElement("label");
+    label.className = "opt";
+    label.innerHTML = `<input type="checkbox" id="${id}" ${o==="minify"?"checked":""}> ${OPT_LABEL[o]}`;
+    optsEl.appendChild(label);
+  });
+  if(current==="html"){
+    const hint = document.createElement("div");
+    hint.style.cssText = "font-size:0.75rem;color:var(--sub);margin:2px 0 8px;";
+    hint.textContent = "※ デッドコード挿入・文字列配列化・制御フロー平坦化は <script> タグ内のJSにのみ適用され、HTML部分は変更されません。";
+    optsEl.appendChild(hint);
+  }
+}
+render();
+
+function isOn(id){ const el = document.getElementById(id); return el && el.checked; }
+function b64u(str){ return btoa(unescape(encodeURIComponent(str))); }
+function rand(arr){ return arr[Math.floor(Math.random()*arr.length)]; }
+
+/* ---------- JS / Node.js (string/template-aware) ---------- */
+function analyzeJS(code){
+  const lines = code.split("\n");
+  let inS=false,inD=false,inT=false,inBC=false,depth=0;
+  const enterInString=[], exitSafe=[];
+  for(let li=0; li<lines.length; li++){
+    enterInString.push(inS||inD||inT||inBC);
+    const line = lines[li]; let inLC=false;
+    for(let i=0;i<line.length;i++){
+      if(inLC) break;
+      const c=line[i], c2=line[i+1];
+      if(inBC){ if(c==="*"&&c2==="/"){inBC=false;i++;} continue; }
+      if(inS){ if(c==="\\"){i++;continue;} if(c==="'"){inS=false;} continue; }
+      if(inD){ if(c==="\\"){i++;continue;} if(c==='"'){inD=false;} continue; }
+      if(inT){ if(c==="\\"){i++;continue;} if(c==="`"){inT=false;} continue; }
+      if(c==="/"&&c2==="/"){ inLC=true; continue; }
+      if(c==="/"&&c2==="*"){ inBC=true; i++; continue; }
+      if(c==="'"){inS=true;continue;}
+      if(c==='"'){inD=true;continue;}
+      if(c==="`"){inT=true;continue;}
+      if(c==="{"||c==="(") depth++;
+      if(c==="}"||c===")") depth--;
+    }
+    exitSafe.push(!inS&&!inD&&!inT&&!inBC&&depth<=0);
+  }
+  return {enterInString, exitSafe};
+}
+function stripCommentsAware(code){
+  let inS=false,inD=false,inT=false,inBC=false,inLC=false,out="";
+  for(let i=0;i<code.length;i++){
+    const c=code[i], c2=code[i+1];
+    if(inLC){ if(c==="\n"){inLC=false; out+=c;} continue; }
+    if(inBC){ if(c==="*"&&c2==="/"){inBC=false;i++;} continue; }
+    if(inS){ out+=c; if(c==="\\"){out+=code[++i]??"";continue;} if(c==="'"){inS=false;} continue; }
+    if(inD){ out+=c; if(c==="\\"){out+=code[++i]??"";continue;} if(c==='"'){inD=false;} continue; }
+    if(inT){ out+=c; if(c==="\\"){out+=code[++i]??"";continue;} if(c==="`"){inT=false;} continue; }
+    if(c==="/"&&c2==="/"){ inLC=true; i++; continue; }
+    if(c==="/"&&c2==="*"){ inBC=true; i++; continue; }
+    if(c==="'"){inS=true; out+=c; continue;}
+    if(c==='"'){inD=true; out+=c; continue;}
+    if(c==="`"){inT=true; out+=c; continue;}
+    out+=c;
+  }
+  return out;
+}
+function minifyJS(code){
+  code = stripCommentsAware(code);
+  const {enterInString} = analyzeJS(code);
+  const lines = code.split("\n");
+  const trimmed = lines.map((l,i)=> enterInString[i] ? l : l.trim());
+  const kept = trimmed.filter((l,i)=> enterInString[i] || l.length>0);
+  return kept.join("\n");
+}
+function oneLineJS(code){
+  const {enterInString} = analyzeJS(code);
+  const lines = code.split("\n");
+  const parts = [];
+  lines.forEach((l,i)=>{
+    if(enterInString[i]){ parts.push("\n"+l); }
+    else { const t=l.trim(); if(t) parts.push(t); }
+  });
+  return parts.join(" ").replace(/ \n/g,"\n").trim();
+}
+function packJS(code){
+  return `eval(decodeURIComponent(escape(atob("${b64u(code)}"))));`;
+}
+function stringArrayJS(code){
+  let i=0,out="",inT=false; const arr=[],map=new Map();
+  while(i<code.length){
+    const c=code[i], c2=code[i+1];
+    if(inT){ out+=c; if(c==="\\"){out+=code[i+1]??"";i+=2;continue;} if(c==="`") inT=false; i++; continue; }
+    if(c==="/"&&c2==="/"){ let j=i; while(j<code.length && code[j]!=="\n"){out+=code[j];j++;} i=j; continue; }
+    if(c==="/"&&c2==="*"){ let j=i; while(j<code.length && !(code[j]==="*"&&code[j+1]==="/")){out+=code[j];j++;} out+=code[j]+(code[j+1]??""); i=j+2; continue; }
+    if(c==="`"){ inT=true; out+=c; i++; continue; }
+    if(c==="'"||c==='"'){
+      const q=c; let raw=c; let j=i+1;
+      while(j<code.length){ if(code[j]==="\\"){raw+=code[j]+(code[j+1]??"");j+=2;continue;} if(code[j]===q){raw+=code[j];j++;break;} raw+=code[j];j++; }
+      let val;
+      try{ val = q==="'" ? JSON.parse('"'+raw.slice(1,-1).replace(/\\'/g,"'").replace(/(^|[^\\])"/g,'$1\\"')+'"') : JSON.parse(raw); }
+      catch(e){ val = raw.slice(1,-1); }
+      if(!map.has(val)){ map.set(val, arr.length); arr.push(val); }
+      out += `_sA[${map.get(val)}]`;
+      i=j; continue;
+    }
+    out+=c; i++;
+  }
+  if(!arr.length) return code;
+  return `var _sA=${JSON.stringify(arr)};\n${out}`;
+}
+function deadCodeJS(code){
+  const {exitSafe} = analyzeJS(code);
+  const pool = [
+    "if(false){console.log('_dbg');}",
+    "var _n"+Math.random().toString(36).slice(2,6)+"=Math.floor(Math.random()*1);",
+    "(function(){return 0;})();",
+    "void 0;",
+    "if(1===2){throw new Error('unreachable');}",
+  ];
+  const lines = code.split("\n");
+  const out = [];
+  lines.forEach((l,i)=>{
+    out.push(l);
+    if(i < lines.length-1 && exitSafe[i] && Math.random() < 0.35) out.push(rand(pool));
+  });
+  return out.join("\n");
+}
+function cffJS(code){
+  const {exitSafe} = analyzeJS(code);
+  const lines = code.split("\n");
+  let current = "";
+  const chunks = [];
+  for(let i=0;i<lines.length;i++){
+    current += (current ? "\n" : "") + lines[i];
+    if(exitSafe[i]){ chunks.push(current); current=""; }
+  }
+  if(current) chunks.push(current);
+  if(chunks.length < 2) return code;
+  const labels = chunks.map((_,i)=>i);
+  for(let i=labels.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [labels[i],labels[j]]=[labels[j],labels[i]]; }
+  let body = "";
+  for(let i=0;i<chunks.length;i++){
+    const next = i+1<chunks.length ? labels[i+1] : -1;
+    body += `case ${labels[i]}:\n${chunks[i]}\n_cfState=${next};break;\n`;
+  }
+  return `var _cfState=${labels[0]};\nwhile(_cfState!==-1){\nswitch(_cfState){\n${body}}\n}`;
+}
+
+/* ---------- HTML / CSS ---------- */
+function minifyHTML(code){
+  code = code.replace(/<!--[\s\S]*?-->/g, "");
+  return code.replace(/>\s+</g, "><").trim();
+}
+function obfuscateHTML(html, f){
+  html = html.replace(/(<script\b[^>]*>)([\s\S]*?)(<\/script>)/gi, (m, open, inner, close)=>{
+    if(/\bsrc\s*=/i.test(open) || !inner.trim()) return m;
+    let r = inner;
+    if(f.deadCode) r = deadCodeJS(r);
+    if(f.stringArray) r = stringArrayJS(r);
+    if(f.cff) r = cffJS(r);
+    if(f.minify) r = minifyJS(r);
+    if(f.pack) r = packJS(r);
+    return open + r + close;
+  });
+  if(f.minify) html = minifyHTML(html);
+  if(f.oneLine) html = html.split("\n").map(l=>l.trim()).filter(Boolean).join("");
+  return html;
+}
+function minifyCSS(code){
+  code = code.replace(/\/\*[\s\S]*?\*\//g, "");
+  code = code.replace(/\s*([{}:;,])\s*/g, "$1").replace(/;}/g,"}").replace(/\n/g,"");
+  return code.trim();
+}
+
+/* ---------- Python ---------- */
+function packPython(code){
+  return `import base64\nexec(base64.b64decode("${b64u(code)}").decode("utf-8"))`;
+}
+function stringArrayPy(code){
+  const re = /(['"])(?:(?!\1)[^\\]|\\.)*\1/g;
+  const arr = []; const map = new Map();
+  const body = code.replace(re, (m)=>{
+    let val;
+    try{ val = (m[0]==="'") ? JSON.parse('"'+m.slice(1,-1).replace(/\\'/g,"'").replace(/(^|[^\\])"/g,'$1\\"')+'"') : JSON.parse(m); }
+    catch(e){ val = m.slice(1,-1); }
+    if(!map.has(val)){ map.set(val, arr.length); arr.push(val); }
+    return `_sA[${map.get(val)}]`;
+  });
+  if(!arr.length) return code;
+  return `_sA = ${JSON.stringify(arr)}\n${body}`;
+}
+function deadCodePy(code){
+  const pool = ["if False:\n    pass", "_d = 1 if False else 0", "_u = None"];
+  const lines = code.split("\n");
+  const out = [];
+  lines.forEach((l,i)=>{
+    out.push(l);
+    const topLevel = /^\S/.test(l) || l.trim()==="";
+    if(i < lines.length-1 && topLevel && /^\S/.test(lines[i+1]||"") && Math.random()<0.35){
+      out.push(rand(pool));
+    }
+  });
+  return out.join("\n");
+}
+
+document.getElementById("run").onclick = ()=>{
+  const src = document.getElementById("input").value;
+  if(!src.trim()){ document.getElementById("output").value = ""; return; }
+  let r = src;
+
+  if(current==="js" || current==="node"){
+    if(isOn("opt_deadCode")) r = deadCodeJS(r);
+    if(isOn("opt_stringArray")) r = stringArrayJS(r);
+    if(isOn("opt_cff")) r = cffJS(r);
+    if(isOn("opt_minify")) r = minifyJS(r);
+    if(isOn("opt_oneLine")) r = oneLineJS(r);
+    if(isOn("opt_pack")) r = packJS(r);
+  } else if(current==="html"){
+    r = obfuscateHTML(r, {
+      deadCode: isOn("opt_deadCode"),
+      stringArray: isOn("opt_stringArray"),
+      cff: isOn("opt_cff"),
+      minify: isOn("opt_minify"),
+      oneLine: isOn("opt_oneLine"),
+      pack: isOn("opt_pack"),
+    });
+  } else if(current==="css"){
+    if(isOn("opt_minify")) r = minifyCSS(r);
+  } else if(current==="py"){
+    if(isOn("opt_deadCode")) r = deadCodePy(r);
+    if(isOn("opt_stringArray")) r = stringArrayPy(r);
+    if(isOn("opt_pack")) r = packPython(r);
+  }
+  document.getElementById("output").value = r;
+};
+
+document.getElementById("clear").onclick = ()=>{
+  document.getElementById("input").value = "";
+  document.getElementById("output").value = "";
+};
+document.getElementById("copy").onclick = async ()=>{
+  const out = document.getElementById("output");
+  if(!out.value) return;
+  try{ await navigator.clipboard.writeText(out.value); }catch(e){ out.select(); document.execCommand("copy"); }
+};
+</script>
+</body>
+</html>
