@@ -65,6 +65,8 @@ button.ghost{background:transparent;color:var(--text);border:1px solid var(--bor
     <b>各オプションの注意点</b><br>
     ・<b>デッドコード挿入 / 制御フロー平坦化</b>：単純な逐次処理コード向けの簡易実装です。関数定義・ループ・クラスをまたぐ複雑な構造では壊れる場合があるため、変換後は必ず動作確認してください。<br>
     ・<b>文字列配列化</b>：テンプレートリテラル(`` ` ``)の中身は抽出対象外ですが、壊さず安全にスキップします。<br>
+    ・<b>変数名を0x形式にリネーム</b>：ラベル文(`label:`)やオブジェクトのメソッド省略記法と変数名が重複する一部の極端なケースでは、安全のためリネームをスキップすることがあります。<br>
+    ・<b>開発者ツール対策</b>：定期的に`debugger`文を実行してステップ実行を妨げます。自分自身で動作確認・デバッグする際は不便になるため、開発中はオフにすることをおすすめします。<br>
     ・文字列やテンプレートリテラル（HTMLを埋め込んだ場合も含む）の途中ではデッドコード挿入・制御フロー平坦化が発生しないよう、文字列の境界を検出して処理します。<br>
     ・全体として暗号化ではなく難読化（可読性を下げる処理）です。マルウェアや検出回避目的の利用はできません。
   </div>
@@ -72,16 +74,20 @@ button.ghost{background:transparent;color:var(--text);border:1px solid var(--bor
 
 <script>
 const LANGS = {
-  js:   {label:"JavaScript", opts:["deadCode","stringArray","cff","minify","oneLine","pack"]},
-  node: {label:"Node.js",    opts:["deadCode","stringArray","cff","minify","oneLine","pack"]},
-  html: {label:"HTML",       opts:["deadCode","stringArray","cff","minify","oneLine","pack"]},
+  js:   {label:"JavaScript", opts:["renameVars","disableConsole","antiDebug","deadCode","stringArray","cff","numberObfuscate","minify","oneLine","pack"]},
+  node: {label:"Node.js",    opts:["renameVars","disableConsole","antiDebug","deadCode","stringArray","cff","numberObfuscate","minify","oneLine","pack"]},
+  html: {label:"HTML",       opts:["renameVars","disableConsole","antiDebug","deadCode","stringArray","cff","numberObfuscate","minify","oneLine","pack"]},
   css:  {label:"CSS",        opts:["minify"]},
-  py:   {label:"Python",     opts:["deadCode","stringArray","pack"]},
+  py:   {label:"Python",     opts:["deadCode","stringArray","numberObfuscate","pack"]},
 };
 const OPT_LABEL = {
+  renameVars:"変数名を0x形式にリネームする",
+  disableConsole:"console出力を無効化する",
+  antiDebug:"開発者ツール対策(debuggerトラップ)",
   deadCode:"デッドコードを挿入する",
   stringArray:"文字列リテラルを配列化する",
   cff:"制御フローをフラット化する",
+  numberObfuscate:"数値を16進数(0x)に変換する",
   minify:"圧縮・コメント除去する",
   oneLine:"コードを1行にする",
   pack:"base64パック (eval/exec方式)",
@@ -112,7 +118,7 @@ function render(){
   if(current==="html"){
     const hint = document.createElement("div");
     hint.style.cssText = "font-size:0.75rem;color:var(--sub);margin:2px 0 8px;";
-    hint.textContent = "※ デッドコード挿入・文字列配列化・制御フロー平坦化は <script> タグ内のJSにのみ適用され、HTML部分は変更されません。";
+    hint.textContent = "※ 変数リネーム・console無効化・開発者ツール対策・デッドコード挿入・文字列配列化・制御フロー平坦化・数値の16進数化は <script> タグ内のJSにのみ適用され、HTML部分は変更されません。";
     optsEl.appendChild(hint);
   }
 }
@@ -123,49 +129,99 @@ function b64u(str){ return btoa(unescape(encodeURIComponent(str))); }
 function rand(arr){ return arr[Math.floor(Math.random()*arr.length)]; }
 
 /* ---------- JS / Node.js (string/template-aware) ---------- */
-function analyzeJS(code){
-  const lines = code.split("\n");
-  let inS=false,inD=false,inT=false,inBC=false,depth=0;
-  const enterInString=[], exitSafe=[];
-  for(let li=0; li<lines.length; li++){
-    enterInString.push(inS||inD||inT||inBC);
-    const line = lines[li]; let inLC=false;
-    for(let i=0;i<line.length;i++){
-      if(inLC) break;
-      const c=line[i], c2=line[i+1];
-      if(inBC){ if(c==="*"&&c2==="/"){inBC=false;i++;} continue; }
-      if(inS){ if(c==="\\"){i++;continue;} if(c==="'"){inS=false;} continue; }
-      if(inD){ if(c==="\\"){i++;continue;} if(c==='"'){inD=false;} continue; }
-      if(inT){ if(c==="\\"){i++;continue;} if(c==="`"){inT=false;} continue; }
-      if(c==="/"&&c2==="/"){ inLC=true; continue; }
-      if(c==="/"&&c2==="*"){ inBC=true; i++; continue; }
-      if(c==="'"){inS=true;continue;}
-      if(c==='"'){inD=true;continue;}
-      if(c==="`"){inT=true;continue;}
-      if(c==="{"||c==="(") depth++;
-      if(c==="}"||c===")") depth--;
-    }
-    exitSafe.push(!inS&&!inD&&!inT&&!inBC&&depth<=0);
+function scanJS(code){
+  const n = code.length;
+  const state = new Array(n);
+  let lastSig = "", wordBuf = "", curWord = "";
+  const rxKeywords = new Set(["return","typeof","instanceof","in","of","new","delete","void","throw","case","do","else","yield","await"]);
+  function allowsRegex(){
+    if(lastSig === "") return true;
+    if(rxKeywords.has(wordBuf)) return true;
+    return "([{,;:!&|?=+-*%^~<>".includes(lastSig);
   }
-  return {enterInString, exitSafe};
+  let i=0;
+  while(i<n){
+    const c=code[i], c2=code[i+1];
+    if(c==="/"&&c2==="/"){
+      let j=i; while(j<n && code[j]!=="\n"){ state[j]="lc"; j++; } i=j; wordBuf=""; curWord=""; continue;
+    }
+    if(c==="/"&&c2==="*"){
+      let j=i; state[j]="bc"; j++;
+      while(j<n && !(code[j]==="*"&&code[j+1]==="/")){ state[j]="bc"; j++; }
+      if(j<n){ state[j]="bc"; if(j+1<n) state[j+1]="bc"; j+=2; }
+      i=j; lastSig="/"; wordBuf=""; curWord=""; continue;
+    }
+    if(c==="'"||c==='"'){
+      const q=c; let j=i; state[j]="str"; j++;
+      while(j<n && code[j]!==q){ if(code[j]==="\\"){ state[j]="str"; j++; if(j<n) state[j]="str"; j++; continue; } state[j]="str"; j++; }
+      if(j<n){ state[j]="str"; j++; }
+      i=j; lastSig=q; wordBuf=""; curWord=""; continue;
+    }
+    if(c==="`"){
+      let j=i; state[j]="tmpl"; j++;
+      while(j<n && code[j]!=="`"){ if(code[j]==="\\"){ state[j]="tmpl"; j++; if(j<n) state[j]="tmpl"; j++; continue; } state[j]="tmpl"; j++; }
+      if(j<n){ state[j]="tmpl"; j++; }
+      i=j; lastSig="`"; wordBuf=""; curWord=""; continue;
+    }
+    if(c==="/" && allowsRegex()){
+      let j=i+1, inClass=false, ok=false;
+      while(j<n){
+        if(code[j]==="\\"){ j+=2; continue; }
+        if(code[j]==="["){ inClass=true; j++; continue; }
+        if(code[j]==="]"){ inClass=false; j++; continue; }
+        if(code[j]==="\n"){ break; }
+        if(code[j]==="/" && !inClass){ ok=true; break; }
+        j++;
+      }
+      if(ok){
+        for(let k=i;k<=j;k++) state[k]="re";
+        let f=j+1;
+        while(f<n && /[a-z]/i.test(code[f])){ state[f]="re"; f++; }
+        i=f; lastSig="/"; wordBuf=""; curWord=""; continue;
+      }
+    }
+    state[i]="code";
+    if(/[A-Za-z0-9_$]/.test(c)){ curWord += c; }
+    else { if(curWord){ wordBuf = curWord; curWord = ""; } }
+    if(!/\s/.test(c)){ lastSig = c; }
+    i++;
+  }
+  return state;
 }
 function stripCommentsAware(code){
-  let inS=false,inD=false,inT=false,inBC=false,inLC=false,out="";
+  const state = scanJS(code);
+  let out = "";
   for(let i=0;i<code.length;i++){
-    const c=code[i], c2=code[i+1];
-    if(inLC){ if(c==="\n"){inLC=false; out+=c;} continue; }
-    if(inBC){ if(c==="*"&&c2==="/"){inBC=false;i++;} continue; }
-    if(inS){ out+=c; if(c==="\\"){out+=code[++i]??"";continue;} if(c==="'"){inS=false;} continue; }
-    if(inD){ out+=c; if(c==="\\"){out+=code[++i]??"";continue;} if(c==='"'){inD=false;} continue; }
-    if(inT){ out+=c; if(c==="\\"){out+=code[++i]??"";continue;} if(c==="`"){inT=false;} continue; }
-    if(c==="/"&&c2==="/"){ inLC=true; i++; continue; }
-    if(c==="/"&&c2==="*"){ inBC=true; i++; continue; }
-    if(c==="'"){inS=true; out+=c; continue;}
-    if(c==='"'){inD=true; out+=c; continue;}
-    if(c==="`"){inT=true; out+=c; continue;}
-    out+=c;
+    if(state[i]==="lc" || state[i]==="bc") continue;
+    out += code[i];
   }
   return out;
+}
+function analyzeJS(code){
+  const state = scanJS(code);
+  let depth = 0;
+  const depthAt = new Array(code.length);
+  for(let i=0;i<code.length;i++){
+    if(state[i]==="code"){ const c=code[i]; if(c==="{"||c==="("||c==="[") depth++; else if(c==="}"||c===")"||c==="]") depth--; }
+    depthAt[i] = depth;
+  }
+  const lines = code.split("\n");
+  const enterInString=[], exitSafe=[];
+  let cum=0;
+  for(let li=0; li<lines.length; li++){
+    const startIdx = cum;
+    const sState = lines[li].length>0 ? state[startIdx] : (startIdx>0 ? state[startIdx-1] : "code");
+    enterInString.push(sState==="str" || sState==="tmpl");
+    cum += lines[li].length;
+    if(li < lines.length-1){
+      const nlIdx = cum;
+      exitSafe.push(state[nlIdx]==="code" && depthAt[nlIdx]<=0);
+      cum += 1;
+    } else {
+      exitSafe.push(true);
+    }
+  }
+  return {enterInString, exitSafe};
 }
 function minifyJS(code){
   code = stripCommentsAware(code);
@@ -188,25 +244,138 @@ function oneLineJS(code){
 function packJS(code){
   return `eval(decodeURIComponent(escape(atob("${b64u(code)}"))));`;
 }
-function stringArrayJS(code){
-  let i=0,out="",inT=false; const arr=[],map=new Map();
+function neighborChars(code, start, end){
+  let b = start-1; while(b>=0 && /\s/.test(code[b])) b--;
+  let f = end; while(f<code.length && /\s/.test(code[f])) f++;
+  return { prevCh: b>=0?code[b]:"", nextCh: f<code.length?code[f]:"" };
+}
+function classifyBrackets(code, state){
+  const n = code.length;
+  const stack = [];
+  const topType = new Array(n);
+  let lastSig = "", wordBuf = "", curWord = "";
+  const exprKeywords = new Set(["return","typeof","instanceof","in","of","new","delete","void","throw","case","do","else","yield","await"]);
+  function exprContext(){
+    if(lastSig === "") return true;
+    if(exprKeywords.has(wordBuf)) return true;
+    return "([{,;:!&|?=+-*%^~<>".includes(lastSig);
+  }
+  for(let i=0;i<n;i++){
+    topType[i] = stack.length ? stack[stack.length-1] : "";
+    if(state[i] !== "code"){ wordBuf=""; curWord=""; continue; }
+    const c = code[i];
+    if(c==="{"){ stack.push(exprContext() ? "obj" : "block"); }
+    else if(c==="}"){ stack.pop(); }
+    else if(c==="("){ stack.push("paren"); }
+    else if(c===")"){ stack.pop(); }
+    else if(c==="["){ stack.push("array"); }
+    else if(c==="]"){ stack.pop(); }
+    if(/[A-Za-z0-9_$]/.test(c)){ curWord += c; } else { if(curWord){ wordBuf = curWord; curWord = ""; } }
+    if(!/\s/.test(c)){ lastSig = c; }
+  }
+  return topType;
+}
+function isObjKeyCtx(code, start, end, topType){
+  const {prevCh, nextCh} = neighborChars(code, start, end);
+  return topType[start]==="obj" && (prevCh==="{"||prevCh===",") && nextCh===":";
+}
+function isShorthandPropCtx(code, start, end, topType){
+  const {prevCh, nextCh} = neighborChars(code, start, end);
+  return topType[start]==="obj" && (prevCh==="{"||prevCh===",") && (nextCh==="}"||nextCh===",");
+}
+function isMethodShorthandCtx(code, start, end, topType){
+  const {prevCh, nextCh} = neighborChars(code, start, end);
+  return topType[start]==="obj" && (prevCh==="{"||prevCh===",") && nextCh==="(";
+}
+const JS_RESERVED = new Set(["break","case","catch","class","const","continue","debugger","default","delete","do","else","export","extends","finally","for","function","if","import","in","instanceof","new","return","super","switch","this","throw","try","typeof","var","void","while","with","yield","let","static","async","await","null","true","false","undefined","NaN","Infinity","window","document","console","Math","JSON","Array","Object","String","Number","Boolean","Promise","Error","TypeError","RangeError","SyntaxError","Date","RegExp","Map","Set","WeakMap","WeakSet","Symbol","Proxy","Reflect","fetch","setTimeout","setInterval","clearTimeout","clearInterval","localStorage","sessionStorage","navigator","location","history","alert","confirm","prompt","parseInt","parseFloat","isNaN","isFinite","encodeURIComponent","decodeURIComponent","btoa","atob","globalThis","module","exports","require","process","Buffer","self","arguments","FormData","Headers","Request","Response","AbortController","URL","URLSearchParams","Blob","File","FileReader","CustomEvent","Event","MutationObserver","IntersectionObserver","structuredClone"]);
+function collectDeclaredNames(code, state){
+  const masked = code.split("").map((ch,i)=> state[i]==="code" ? ch : " ").join("");
+  const names = new Set();
+  let m;
+  const declRe = /\b(?:var|let|const)\s+([A-Za-z_$][A-Za-zA-Z0-9_$]*)/g;
+  while((m=declRe.exec(masked))) names.add(m[1]);
+  const fnRe = /\bfunction\s*(?:\*\s*)?([A-Za-z_$][A-Za-zA-Z0-9_$]*)\s*\(/g;
+  while((m=fnRe.exec(masked))) names.add(m[1]);
+  const paramListRe = /\bfunction\s*\*?\s*[A-Za-z_$]*\s*\(([^)]*)\)|\(([^)]*)\)\s*=>|^\s*([A-Za-z_$][A-Za-zA-Z0-9_$]*)\s*=>/gm;
+  while((m=paramListRe.exec(masked))){
+    const list = m[1]||m[2]||m[3];
+    if(!list) continue;
+    list.split(",").forEach(p=>{ const name = p.trim(); if(/^[A-Za-z_$][A-Za-zA-Z0-9_$]*$/.test(name)) names.add(name); });
+  }
+  return names;
+}
+function renameVarsJS(code){
+  const state = scanJS(code);
+  const topType = classifyBrackets(code, state);
+  const names = collectDeclaredNames(code, state);
+  const map = new Map();
+  const used = new Set();
+  names.forEach(name=>{
+    if(JS_RESERVED.has(name) || name==="_sA" || name==="_cfState" || /^_n[a-z0-9]{4}$/.test(name)) return;
+    let hex;
+    do{ hex = "_0x" + Math.floor(Math.random()*0xffffff).toString(16); } while(used.has(hex));
+    used.add(hex);
+    map.set(name, hex);
+  });
+  if(!map.size) return code;
+  let out = "", i = 0;
   while(i<code.length){
-    const c=code[i], c2=code[i+1];
-    if(inT){ out+=c; if(c==="\\"){out+=code[i+1]??"";i+=2;continue;} if(c==="`") inT=false; i++; continue; }
-    if(c==="/"&&c2==="/"){ let j=i; while(j<code.length && code[j]!=="\n"){out+=code[j];j++;} i=j; continue; }
-    if(c==="/"&&c2==="*"){ let j=i; while(j<code.length && !(code[j]==="*"&&code[j+1]==="/")){out+=code[j];j++;} out+=code[j]+(code[j+1]??""); i=j+2; continue; }
-    if(c==="`"){ inT=true; out+=c; i++; continue; }
-    if(c==="'"||c==='"'){
-      const q=c; let raw=c; let j=i+1;
-      while(j<code.length){ if(code[j]==="\\"){raw+=code[j]+(code[j+1]??"");j+=2;continue;} if(code[j]===q){raw+=code[j];j++;break;} raw+=code[j];j++; }
+    if(state[i]==="code" && /[A-Za-z_$]/.test(code[i]) && !(i>0 && /[0-9]/.test(code[i-1]))){
+      let j=i+1;
+      while(j<code.length && state[j]==="code" && /[A-Za-z0-9_$]/.test(code[j])) j++;
+      const token = code.slice(i,j);
+      if(!map.has(token) || code[i-1]==="." || isObjKeyCtx(code,i,j,topType) || isMethodShorthandCtx(code,i,j,topType)){
+        out += token;
+      } else if(isShorthandPropCtx(code,i,j,topType)){
+        out += token + ": " + map.get(token);
+      } else {
+        out += map.get(token);
+      }
+      i=j;
+    } else { out += code[i]; i++; }
+  }
+  return out;
+}
+function numberObfuscateJS(code){
+  const state = scanJS(code);
+  let out = "", i = 0;
+  while(i<code.length){
+    if(state[i]==="code"){
+      let j=i; while(j<code.length && state[j]==="code") j++;
+      let seg = code.slice(i,j);
+      seg = seg.replace(/(?<![\w.$])(\d+)(?![\w.])/g, m => "0x"+parseInt(m,10).toString(16));
+      out += seg; i=j;
+    } else { out += code[i]; i++; }
+  }
+  return out;
+}
+function disableConsoleJS(code){
+  const shim = "(function(){try{var _k=['log','info','warn','debug','trace','dir','table'];for(var i=0;i<_k.length;i++){console[_k[i]]=function(){};}}catch(e){}})();\n";
+  return shim + code;
+}
+function antiDebugJS(code){
+  const trap = "(function(){try{setInterval(function(){debugger;},2000);}catch(e){}})();\n";
+  return trap + code;
+}
+function stringArrayJS(code){
+  const state = scanJS(code);
+  const topType = classifyBrackets(code, state);
+  const arr=[]; const map=new Map();
+  let out="", i=0;
+  while(i<code.length){
+    if(state[i]==="str"){
+      let j=i; while(j<code.length && state[j]==="str") j++;
+      const raw = code.slice(i,j);
       let val;
-      try{ val = q==="'" ? JSON.parse('"'+raw.slice(1,-1).replace(/\\'/g,"'").replace(/(^|[^\\])"/g,'$1\\"')+'"') : JSON.parse(raw); }
+      try{ val = raw[0]==="'" ? JSON.parse('"'+raw.slice(1,-1).replace(/\\'/g,"'").replace(/(^|[^\\])"/g,'$1\\"')+'"') : JSON.parse(raw); }
       catch(e){ val = raw.slice(1,-1); }
       if(!map.has(val)){ map.set(val, arr.length); arr.push(val); }
-      out += `_sA[${map.get(val)}]`;
-      i=j; continue;
+      const ref = `_sA[${map.get(val)}]`;
+      out += isObjKeyCtx(code, i, j, topType) ? `[${ref}]` : ref;
+      i=j;
+    } else {
+      out += code[i]; i++;
     }
-    out+=c; i++;
   }
   if(!arr.length) return code;
   return `var _sA=${JSON.stringify(arr)};\n${out}`;
@@ -239,12 +408,22 @@ function cffJS(code){
   }
   if(current) chunks.push(current);
   if(chunks.length < 2) return code;
-  const labels = chunks.map((_,i)=>i);
+  // switch/while wraps each chunk in its own loop iteration, which re-creates a
+  // fresh block scope every pass. let/const declared in one chunk would then be
+  // in the temporal dead zone when a later chunk (a different iteration) refers
+  // to it, so top-level let/const must become var (function-scoped, no TDZ,
+  // persists across iterations) to keep the code working the same way.
+  const hoisted = chunks.map(ch=>{
+    const m = ch.match(/^(\s*)(const|let)\b/);
+    if(!m) return ch;
+    return m[1] + "var" + ch.slice(m[0].length);
+  });
+  const labels = hoisted.map((_,i)=>i);
   for(let i=labels.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [labels[i],labels[j]]=[labels[j],labels[i]]; }
   let body = "";
-  for(let i=0;i<chunks.length;i++){
-    const next = i+1<chunks.length ? labels[i+1] : -1;
-    body += `case ${labels[i]}:\n${chunks[i]}\n_cfState=${next};break;\n`;
+  for(let i=0;i<hoisted.length;i++){
+    const next = i+1<hoisted.length ? labels[i+1] : -1;
+    body += `case ${labels[i]}:\n${hoisted[i]}\n_cfState=${next};break;\n`;
   }
   return `var _cfState=${labels[0]};\nwhile(_cfState!==-1){\nswitch(_cfState){\n${body}}\n}`;
 }
@@ -258,9 +437,13 @@ function obfuscateHTML(html, f){
   html = html.replace(/(<script\b[^>]*>)([\s\S]*?)(<\/script>)/gi, (m, open, inner, close)=>{
     if(/\bsrc\s*=/i.test(open) || !inner.trim()) return m;
     let r = inner;
+    if(f.renameVars) r = renameVarsJS(r);
+    if(f.disableConsole) r = disableConsoleJS(r);
+    if(f.antiDebug) r = antiDebugJS(r);
     if(f.deadCode) r = deadCodeJS(r);
     if(f.stringArray) r = stringArrayJS(r);
     if(f.cff) r = cffJS(r);
+    if(f.numberObfuscate) r = numberObfuscateJS(r);
     if(f.minify) r = minifyJS(r);
     if(f.pack) r = packJS(r);
     return open + r + close;
@@ -305,6 +488,30 @@ function deadCodePy(code){
   });
   return out.join("\n");
 }
+function numberObfuscatePy(code){
+  let out = "", i = 0;
+  while(i<code.length){
+    const c = code[i];
+    if(c==="'"||c==='"'){
+      const q=c; let j=i+1;
+      while(j<code.length && code[j]!==q){ if(code[j]==="\\"){ j+=2; continue; } j++; }
+      j = Math.min(j+1, code.length);
+      out += code.slice(i,j); i=j; continue;
+    }
+    if(c==="#"){
+      let j=i; while(j<code.length && code[j]!=="\n") j++;
+      out += code.slice(i,j); i=j; continue;
+    }
+    const m = /^\d+/.exec(code.slice(i));
+    if(m && !/[\w.]/.test(code[i-1]||"") && !/[\w.]/.test(code[i+m[0].length]||"")){
+      out += "0x"+parseInt(m[0],10).toString(16);
+      i += m[0].length;
+      continue;
+    }
+    out += c; i++;
+  }
+  return out;
+}
 
 document.getElementById("run").onclick = ()=>{
   const src = document.getElementById("input").value;
@@ -312,17 +519,25 @@ document.getElementById("run").onclick = ()=>{
   let r = src;
 
   if(current==="js" || current==="node"){
+    if(isOn("opt_renameVars")) r = renameVarsJS(r);
+    if(isOn("opt_disableConsole")) r = disableConsoleJS(r);
+    if(isOn("opt_antiDebug")) r = antiDebugJS(r);
     if(isOn("opt_deadCode")) r = deadCodeJS(r);
     if(isOn("opt_stringArray")) r = stringArrayJS(r);
     if(isOn("opt_cff")) r = cffJS(r);
+    if(isOn("opt_numberObfuscate")) r = numberObfuscateJS(r);
     if(isOn("opt_minify")) r = minifyJS(r);
     if(isOn("opt_oneLine")) r = oneLineJS(r);
     if(isOn("opt_pack")) r = packJS(r);
   } else if(current==="html"){
     r = obfuscateHTML(r, {
+      renameVars: isOn("opt_renameVars"),
+      disableConsole: isOn("opt_disableConsole"),
+      antiDebug: isOn("opt_antiDebug"),
       deadCode: isOn("opt_deadCode"),
       stringArray: isOn("opt_stringArray"),
       cff: isOn("opt_cff"),
+      numberObfuscate: isOn("opt_numberObfuscate"),
       minify: isOn("opt_minify"),
       oneLine: isOn("opt_oneLine"),
       pack: isOn("opt_pack"),
@@ -332,6 +547,7 @@ document.getElementById("run").onclick = ()=>{
   } else if(current==="py"){
     if(isOn("opt_deadCode")) r = deadCodePy(r);
     if(isOn("opt_stringArray")) r = stringArrayPy(r);
+    if(isOn("opt_numberObfuscate")) r = numberObfuscatePy(r);
     if(isOn("opt_pack")) r = packPython(r);
   }
   document.getElementById("output").value = r;
